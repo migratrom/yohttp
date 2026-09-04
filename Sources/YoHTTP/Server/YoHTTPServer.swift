@@ -41,14 +41,103 @@ private struct HTTPConnection: Sendable {
     let remoteAddress: SocketAddress?
 }
 
-private struct RequestAccumulator {
-    var head: HTTPRequestHead?
-    var body = ByteBuffer()
+/// A bounded, single-reader bridge between the NIO connection task and a handler.
+/// Suspending `send` stops consumption from `NIOAsyncChannel`, whose own watermarks
+/// then apply back pressure to the socket.
+actor RequestBodyChannel: BodyStorage {
+    private let capacity: Int
+    private var buffered: [ByteBuffer] = []
+    private var reader: CheckedContinuation<ByteBuffer?, Swift.Error>?
+    private var writers: [CheckedContinuation<Void, Swift.Error>] = []
+    private var finished = false
+    private var cancelled = false
+    private var reachedEnd = false
 
-    mutating func reset() {
-        head = nil
-        body.clear()
+    init(capacity: Int = 8) {
+        self.capacity = capacity
     }
+
+    func send(_ buffer: ByteBuffer) async throws {
+        guard !cancelled, !finished else { throw CancellationError() }
+        if let reader {
+            self.reader = nil
+            reader.resume(returning: buffer)
+            return
+        }
+        while buffered.count >= capacity {
+            try await withCheckedThrowingContinuation { continuation in
+                writers.append(continuation)
+            }
+            guard !cancelled, !finished else { throw CancellationError() }
+        }
+        buffered.append(buffer)
+    }
+
+    func nextChunk() async throws -> ByteBuffer? {
+        if !buffered.isEmpty {
+            let buffer = buffered.removeFirst()
+            if !writers.isEmpty {
+                writers.removeFirst().resume()
+            }
+            return buffer
+        }
+        if cancelled { throw CancellationError() }
+        if finished {
+            reachedEnd = true
+            return nil
+        }
+        let value = try await withCheckedThrowingContinuation { continuation in
+            reader = continuation
+        }
+        if value == nil { reachedEnd = true }
+        return value
+    }
+
+    func finish() {
+        guard !finished, !cancelled else { return }
+        finished = true
+        if buffered.isEmpty, let reader {
+            self.reader = nil
+            reader.resume(returning: nil)
+        }
+    }
+
+    func cancel() {
+        guard !cancelled else { return }
+        cancelled = true
+        if let reader {
+            self.reader = nil
+            reader.resume(throwing: CancellationError())
+        }
+        for writer in writers {
+            writer.resume(throwing: CancellationError())
+        }
+        writers.removeAll()
+        buffered.removeAll()
+    }
+
+    func hasReachedEnd() -> Bool { reachedEnd }
+}
+
+private actor ResponseResult {
+    private var response: Response?
+    private var waiter: CheckedContinuation<Response, Never>?
+
+    func complete(_ response: Response) {
+        guard self.response == nil else { return }
+        self.response = response
+        if let waiter {
+            self.waiter = nil
+            waiter.resume(returning: response)
+        }
+    }
+
+    func value() async -> Response {
+        if let response { return response }
+        return await withCheckedContinuation { waiter = $0 }
+    }
+
+    func peek() -> Response? { response }
 }
 
 /// A Swift Concurrency-native HTTP/1.1 server backed by SwiftNIO.
@@ -64,8 +153,14 @@ public final class YoHTTPServer: Sendable {
     private let state = Mutex(State())
     private let registeredHandler = Mutex<Handler?>(nil)
     private let eventLoopGroup: MultiThreadedEventLoopGroup
+    private let afterBinding: (@Sendable () async -> Void)?
 
-    public init() {
+    public convenience init() {
+        self.init(afterBinding: nil)
+    }
+
+    init(afterBinding: (@Sendable () async -> Void)?) {
+        self.afterBinding = afterBinding
         eventLoopGroup = .singleton
     }
 
@@ -100,9 +195,10 @@ public final class YoHTTPServer: Sendable {
 
         do {
             let serverChannel = try await makeServerChannel(configuration: configuration)
+            if let afterBinding { await afterBinding() }
             let shouldStop = state.withLock { state in
                 state.channel = serverChannel.channel
-                state.address = Self.address(from: serverChannel.channel.localAddress)
+                state.address = Self.address(from: serverChannel.channel.localAddress!)
                 state.isBinding = false
                 return state.shutdownRequested
             }
@@ -158,7 +254,7 @@ public final class YoHTTPServer: Sendable {
                     )
                     return HTTPConnection(
                         channel: asyncChannel,
-                        remoteAddress: Self.address(from: channel.remoteAddress)
+                        remoteAddress: Self.address(from: channel.remoteAddress!)
                     )
                 }
             }
@@ -189,17 +285,26 @@ public final class YoHTTPServer: Sendable {
 
     private func handle(_ connection: HTTPConnection, configuration: ServerConfiguration) async throws {
         try await connection.channel.executeThenClose { inbound, outbound in
-            var request = RequestAccumulator()
+            var current: (head: HTTPRequestHead, body: RequestBodyChannel, result: ResponseResult, task: Task<Void, Never>, responseWriter: Task<Bool, Swift.Error>?, receivedBytes: Int, expectsBody: Bool)?
 
             for try await part in inbound {
                 switch part {
                 case .head(let head):
-                    request.reset()
-                    request.head = head
-                case .body(var buffer):
-                    guard request.head != nil else { throw Abort(.badRequest, body: "Body received before request head") }
-                    guard request.body.readableBytes + buffer.readableBytes <= configuration.maxRequestBodySize else {
-                        try await write(
+                    guard current == nil else { throw Abort(.badRequest, body: "Request head received before prior request ended") }
+                    let body = RequestBodyChannel()
+                    let result = ResponseResult()
+                    let request = makeRequest(head: head, body: Body(storage: body), remoteAddress: connection.remoteAddress)
+                    let task = Task { [self] in
+                        let response = await response(for: request, timeout: configuration.requestTimeout)
+                        await result.complete(response)
+                    }
+                    current = (head, body, result, task, nil, 0, Self.requestHasBody(head))
+                case .body(let buffer):
+                    guard var request = current else { throw Abort(.badRequest, body: "Body received before request head") }
+                    guard request.receivedBytes <= configuration.maxRequestBodySize - buffer.readableBytes else {
+                        request.task.cancel()
+                        await request.body.cancel()
+                        _ = try await write(
                             Response.text("Content Too Large", status: .contentTooLarge),
                             for: request.head,
                             to: outbound,
@@ -208,24 +313,57 @@ public final class YoHTTPServer: Sendable {
                         )
                         return
                     }
-                    request.body.writeBuffer(&buffer)
+                    if request.responseWriter == nil, let response = await request.result.peek() {
+                        guard response.body.sharesStorage(with: Body(storage: request.body)) else {
+                            await request.body.cancel()
+                            _ = try await write(response, for: request.head, to: outbound, configuration: configuration, forceClose: true)
+                            return
+                        }
+                        let responseToWrite = response
+                        let requestHead = request.head
+                        let outboundWriter = outbound
+                        let serverConfiguration = configuration
+                        request.responseWriter = Task { @Sendable [self] in
+                            try await write(
+                                responseToWrite,
+                                for: requestHead,
+                                to: outboundWriter,
+                                configuration: serverConfiguration
+                            )
+                        }
+                    }
+                    request.receivedBytes += buffer.readableBytes
+                    current = request
+                    try await request.body.send(buffer)
                 case .end:
-                    guard let head = request.head else { throw Abort(.badRequest, body: "Request ended before request head") }
-                    let response = await response(
-                        for: makeRequest(head: head, body: request.body, remoteAddress: connection.remoteAddress),
-                        timeout: configuration.requestTimeout
+                    guard let request = current else { throw Abort(.badRequest, body: "Request ended before request head") }
+                    await request.body.finish()
+                    if let writer = request.responseWriter {
+                        let keepAlive = try await writer.value
+                        current = nil
+                        if !keepAlive { return }
+                        continue
+                    }
+                    let response = await request.result.value()
+                    let streamsRequestBody = response.body.sharesStorage(with: Body(storage: request.body))
+                    let reachedEnd = await request.body.hasReachedEnd()
+                    let forceClose = request.expectsBody && !reachedEnd && !streamsRequestBody
+                    let keepAlive = try await write(
+                        response,
+                        for: request.head,
+                        to: outbound,
+                        configuration: configuration,
+                        forceClose: forceClose
                     )
-                    try await write(response, for: head, to: outbound, configuration: configuration)
-                    request.reset()
+                    current = nil
+                    if !keepAlive { return }
                 }
             }
         }
     }
 
     private func response(for request: Request, timeout: Duration?) async -> Response {
-        guard let handler = registeredHandler.withLock({ $0 }) else {
-            return .text("Service Unavailable", status: .serviceUnavailable)
-        }
+        let handler = registeredHandler.withLock { $0! }
         do {
             if let timeout {
                 return try await Self.withTimeout(timeout) { try await handler(request) }
@@ -242,55 +380,67 @@ public final class YoHTTPServer: Sendable {
 
     private func makeRequest(
         head: HTTPRequestHead,
-        body: ByteBuffer,
+        body: Body,
         remoteAddress: SocketAddress?
     ) -> Request {
         var headers = Headers()
         for field in head.headers { headers.add(field.name, field.value) }
-        var body = body
-        let bytes = body.readBytes(length: body.readableBytes) ?? []
         return Request(
             method: Method(rawValue: head.method.rawValue),
             uri: head.uri,
             headers: headers,
-            body: Body(Data(bytes)),
+            body: body,
             remoteAddress: remoteAddress
         )
     }
 
     private func write(
         _ response: Response,
-        for requestHead: HTTPRequestHead?,
+        for requestHead: HTTPRequestHead,
         to outbound: NIOAsyncChannelOutboundWriter<SendableResponsePart>,
         configuration: ServerConfiguration,
         forceClose: Bool = false
-    ) async throws {
-        let requestMethod = requestHead.map { Method(rawValue: $0.method.rawValue) }
+    ) async throws -> Bool {
+        var response = response
+        if (100..<200).contains(response.status.code) {
+            response = .text("Internal Server Error", status: .internalServerError)
+        }
+        let requestMethod = Method(rawValue: requestHead.method.rawValue)
         let statusOmitsBody = (100..<200).contains(response.status.code)
             || response.status.code == 204
             || response.status.code == 304
         let omitBody = statusOmitsBody || requestMethod == .HEAD
         var headers = response.headers
         headers.remove("Transfer-Encoding")
-        headers["Content-Length"] = String(statusOmitsBody ? 0 : response.body.count)
+        headers.remove("Content-Length")
+        if statusOmitsBody {
+            headers["Content-Length"] = "0"
+        } else if let length = response.body.knownLength {
+            headers["Content-Length"] = String(length)
+        } else if requestMethod != .HEAD {
+            headers["Transfer-Encoding"] = "chunked"
+        }
         if let serverName = configuration.serverName, !headers.contains("Server") {
             headers["Server"] = serverName
         }
 
-        let keepAlive = !forceClose && (requestHead?.isKeepAlive ?? false)
+        let keepAlive = !forceClose && requestHead.isKeepAlive
         if !keepAlive { headers["Connection"] = "close" }
 
         var nioHeaders = HTTPHeaders()
         for (name, value) in headers { nioHeaders.add(name: name, value: value) }
-        let version = requestHead?.version ?? .http1_1
+        let version = requestHead.version
         let status = HTTPResponseStatus(statusCode: response.status.code, reasonPhrase: response.status.reasonPhrase)
 
         try await outbound.write(.head(HTTPResponseHead(version: version, status: status, headers: nioHeaders)))
-        if !omitBody, !response.body.isEmpty {
-            try await outbound.write(.body(ByteBuffer(bytes: response.body.data())))
+        if !omitBody {
+            for try await chunk in response.body where chunk.readableBytes > 0 {
+                try await outbound.write(.body(chunk))
+            }
         }
         try await outbound.write(.end(nil))
         if !keepAlive { outbound.finish() }
+        return keepAlive
     }
 
     private func clearState() {
@@ -318,9 +468,21 @@ public final class YoHTTPServer: Sendable {
         }
     }
 
-    private static func address(from address: NIOCore.SocketAddress?) -> SocketAddress? {
-        guard let address else { return nil }
-        return SocketAddress(host: address.ipAddress ?? address.description, port: address.port)
+    static func requestHasBody(_ head: HTTPRequestHead) -> Bool {
+        for header in head.headers {
+            if header.name.caseInsensitiveCompare("transfer-encoding") == .orderedSame {
+                return true
+            }
+            if header.name.caseInsensitiveCompare("content-length") == .orderedSame,
+               (Int(header.value.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0) > 0 {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func address(from address: NIOCore.SocketAddress) -> SocketAddress {
+        SocketAddress(host: address.ipAddress!, port: address.port)
     }
 
     private struct TimeoutError: Error {}
@@ -335,7 +497,7 @@ public final class YoHTTPServer: Sendable {
                 try await Task.sleep(for: duration)
                 throw TimeoutError()
             }
-            guard let first = try await group.next() else { throw CancellationError() }
+            let first = try await group.next()!
             group.cancelAll()
             return first
         }

@@ -1,6 +1,6 @@
 import Foundation
 
-public struct Response: Sendable, Equatable {
+public struct Response: Sendable {
     public var status: Status
     public var headers: Headers
     public var body: Body

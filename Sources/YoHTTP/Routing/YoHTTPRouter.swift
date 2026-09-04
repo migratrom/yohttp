@@ -1,80 +1,15 @@
 import Foundation
 import Synchronization
 
-public struct RouteHandlers: Sendable {
-    public var GET: Handler?
-    public var POST: Handler?
-    public var PUT: Handler?
-    public var PATCH: Handler?
-    public var DELETE: Handler?
-    public var OPTIONS: Handler?
-    public var HEAD: Handler?
-
-    public init(
-        GET: Handler? = nil,
-        POST: Handler? = nil,
-        PUT: Handler? = nil,
-        PATCH: Handler? = nil,
-        DELETE: Handler? = nil,
-        OPTIONS: Handler? = nil,
-        HEAD: Handler? = nil
-    ) {
-        self.GET = GET
-        self.POST = POST
-        self.PUT = PUT
-        self.PATCH = PATCH
-        self.DELETE = DELETE
-        self.OPTIONS = OPTIONS
-        self.HEAD = HEAD
-    }
-
-    fileprivate subscript(method: Method) -> Handler? {
-        get {
-            switch method {
-            case .GET: GET
-            case .POST: POST
-            case .PUT: PUT
-            case .PATCH: PATCH
-            case .DELETE: DELETE
-            case .OPTIONS: OPTIONS
-            case .HEAD: HEAD
-            default: nil
-            }
-        }
-        set {
-            switch method {
-            case .GET: GET = newValue
-            case .POST: POST = newValue
-            case .PUT: PUT = newValue
-            case .PATCH: PATCH = newValue
-            case .DELETE: DELETE = newValue
-            case .OPTIONS: OPTIONS = newValue
-            case .HEAD: HEAD = newValue
-            default: break
-            }
-        }
-    }
-
-    fileprivate var methods: [Method] {
-        [Method.GET, .POST, .PUT, .PATCH, .DELETE, .HEAD, .OPTIONS].filter { self[$0] != nil }
-    }
-}
-
-/// A concurrency-safe HTTP request router.
+/// A concurrency-safe HTTP request router for macro-declared endpoints.
 public final class YoHTTPRouter: Sendable {
-    private enum Segment: Sendable, Equatable {
-        case literal(String)
-        case parameter(String)
-        case wildcard(String)
-    }
-
     private struct Route: Sendable {
-        var segments: [Segment]
-        var handlers: RouteHandlers
+        var definition: RouteDefinition
+        var handler: Handler
         var order: Int
 
         var specificity: Int {
-            segments.reduce(0) { result, segment in
+            definition.segments.reduce(0) { result, segment in
                 switch segment {
                 case .literal: result + 100
                 case .parameter: result + 10
@@ -82,6 +17,12 @@ public final class YoHTTPRouter: Sendable {
                 }
             }
         }
+    }
+
+    private enum ShapeSegment: Equatable {
+        case literal(String)
+        case parameter
+        case wildcard
     }
 
     private struct MiddlewareEntry: Sendable {
@@ -112,43 +53,29 @@ public final class YoHTTPRouter: Sendable {
         self.prefix = prefix
     }
 
-    public func path(_ path: String, handlers: RouteHandlers) {
-        let segments = Self.parsePattern(Self.join(prefix, path))
-        storage.state.withLock { state in
-            if let index = state.routes.firstIndex(where: { $0.segments == segments }) {
-                var existing = state.routes[index].handlers
-                for method in handlers.methods { existing[method] = handlers[method] }
-                state.routes[index].handlers = existing
-            } else {
-                state.routes.append(Route(segments: segments, handlers: handlers, order: state.nextOrder))
+    /// Registers every HTTP method declared by a macro-generated endpoint.
+    public func register<Endpoint: RouteEndpoint>(_ endpoint: Endpoint.Type) {
+        for definition in endpoint.routeDefinitions {
+            let prefixed = RouteDefinition(
+                method: definition.method,
+                segments: Self.prefixedSegments(prefix, definition.segments)
+            )
+            Self.validate(prefixed)
+            let handler: Handler = { request in try await endpoint.respond(to: request) }
+
+            storage.state.withLock { state in
+                let shape = Self.shape(of: prefixed.segments)
+                precondition(
+                    !state.routes.contains {
+                        $0.definition.method == prefixed.method && Self.shape(of: $0.definition.segments) == shape
+                    },
+                    "A route for \(prefixed.method.rawValue) \(Self.displayPath(prefixed.segments)) is already registered"
+                )
+                state.routes.append(Route(definition: prefixed, handler: handler, order: state.nextOrder))
                 state.nextOrder += 1
             }
         }
     }
-
-    public func path(_ path: String, _ configure: (inout RouteHandlers) -> Void) {
-        var handlers = RouteHandlers()
-        configure(&handlers)
-        self.path(path, handlers: handlers)
-    }
-
-    public func route(_ method: Method, _ path: String, handler: @escaping Handler) {
-        precondition(
-            [.GET, .POST, .PUT, .PATCH, .DELETE, .HEAD, .OPTIONS].contains(method),
-            "YoHTTPRouter does not support dispatching \(method.rawValue)"
-        )
-        var handlers = RouteHandlers()
-        handlers[method] = handler
-        self.path(path, handlers: handlers)
-    }
-
-    public func GET(_ path: String, handler: @escaping Handler) { route(.GET, path, handler: handler) }
-    public func POST(_ path: String, handler: @escaping Handler) { route(.POST, path, handler: handler) }
-    public func PUT(_ path: String, handler: @escaping Handler) { route(.PUT, path, handler: handler) }
-    public func PATCH(_ path: String, handler: @escaping Handler) { route(.PATCH, path, handler: handler) }
-    public func DELETE(_ path: String, handler: @escaping Handler) { route(.DELETE, path, handler: handler) }
-    public func OPTIONS(_ path: String, handler: @escaping Handler) { route(.OPTIONS, path, handler: handler) }
-    public func HEAD(_ path: String, handler: @escaping Handler) { route(.HEAD, path, handler: handler) }
 
     public func middleware(_ middleware: @escaping Middleware) {
         storage.state.withLock { state in
@@ -211,7 +138,7 @@ public final class YoHTTPRouter: Sendable {
     private static func resolve(request: Request, routes: [Route]) -> Resolution {
         let pathSegments = splitPath(request.path)
         let matches = routes.compactMap { route -> Match? in
-            match(route.segments, path: pathSegments).map { Match(route: route, parameters: $0) }
+            match(route.definition.segments, path: pathSegments).map { Match(route: route, parameters: $0) }
         }.sorted {
             if $0.route.specificity != $1.route.specificity {
                 return $0.route.specificity > $1.route.specificity
@@ -220,28 +147,27 @@ public final class YoHTTPRouter: Sendable {
         }
 
         guard !matches.isEmpty else { return .notFound }
-        let allowed = Set(matches.flatMap(\.route.handlers.methods))
+        let allowed = Set(matches.map(\.route.definition.method))
             .union([.OPTIONS])
-            .union(matches.contains { $0.route.handlers.GET != nil } ? [.HEAD] : [])
+            .union(matches.contains { $0.route.definition.method == .GET } ? [.HEAD] : [])
         let allowHeader = allowed.sorted { $0.rawValue < $1.rawValue }.map(\.rawValue).joined(separator: ", ")
 
         if request.method == .OPTIONS,
-           !matches.contains(where: { $0.route.handlers.OPTIONS != nil }) {
+           !matches.contains(where: { $0.route.definition.method == .OPTIONS }) {
             return .automaticOptions(allowHeader)
         }
 
-        for match in matches {
-            if let handler = match.route.handlers[request.method] {
-                return .handler(handler, match.parameters)
-            }
-            if request.method == .HEAD, let handler = match.route.handlers.GET {
-                return .handler(handler, match.parameters)
-            }
+        if let match = matches.first(where: { $0.route.definition.method == request.method }) {
+            return .handler(match.route.handler, match.parameters)
+        }
+        if request.method == .HEAD,
+           let match = matches.first(where: { $0.route.definition.method == .GET }) {
+            return .handler(match.route.handler, match.parameters)
         }
         return .methodNotAllowed(allowHeader)
     }
 
-    private static func match(_ pattern: [Segment], path: [String]) -> [String: String]? {
+    private static func match(_ pattern: [RouteSegment], path: [String]) -> [String: String]? {
         var parameters: [String: String] = [:]
         var index = 0
         for segment in pattern {
@@ -262,23 +188,46 @@ public final class YoHTTPRouter: Sendable {
         return index == path.count ? parameters : nil
     }
 
-    private static func parsePattern(_ path: String) -> [Segment] {
+    private static func validate(_ definition: RouteDefinition) {
+        let supported: Set<Method> = [.GET, .POST, .PUT, .PATCH, .DELETE, .OPTIONS, .HEAD]
+        precondition(supported.contains(definition.method), "YoHTTPRouter does not support dispatching \(definition.method.rawValue)")
+
         var names = Set<String>()
-        let parts = splitPath(path)
-        return parts.enumerated().map { index, part in
-            if part.hasPrefix(":") {
-                let name = String(part.dropFirst())
-                precondition(!name.isEmpty && names.insert(name).inserted, "Invalid or duplicate path parameter in \(path)")
-                return .parameter(name)
+        for (index, segment) in definition.segments.enumerated() {
+            switch segment {
+            case .literal:
+                continue
+            case .parameter(let name):
+                precondition(!name.isEmpty && names.insert(name).inserted, "Invalid or duplicate path parameter")
+            case .wildcard(let name):
+                precondition(!name.isEmpty && names.insert(name).inserted, "Invalid wildcard")
+                precondition(index == definition.segments.count - 1, "A wildcard must be the final path segment")
             }
-            if part.hasPrefix("*") {
-                let name = String(part.dropFirst())
-                precondition(!name.isEmpty && names.insert(name).inserted, "Invalid wildcard in \(path)")
-                precondition(index == parts.count - 1, "A wildcard must be the final path segment in \(path)")
-                return .wildcard(name)
-            }
-            return .literal(part)
         }
+    }
+
+    private static func prefixedSegments(_ prefix: String, _ segments: [RouteSegment]) -> [RouteSegment] {
+        splitPath(prefix).map(RouteSegment.literal) + segments
+    }
+
+    private static func shape(of segments: [RouteSegment]) -> [ShapeSegment] {
+        segments.map {
+            switch $0 {
+            case .literal(let value): .literal(value)
+            case .parameter: .parameter
+            case .wildcard: .wildcard
+            }
+        }
+    }
+
+    private static func displayPath(_ segments: [RouteSegment]) -> String {
+        "/" + segments.map {
+            switch $0 {
+            case .literal(let value): value
+            case .parameter(let name): "{\(name)}"
+            case .wildcard(let name): "{*\(name)}"
+            }
+        }.joined(separator: "/")
     }
 
     private static func splitPath(_ path: String) -> [String] {

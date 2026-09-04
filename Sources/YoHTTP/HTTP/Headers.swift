@@ -21,7 +21,10 @@ public struct Headers: Sendable, Sequence, ExpressibleByDictionaryLiteral, Equat
     public subscript(_ name: String) -> String? {
         get { fields.first { $0.normalizedName == Self.normalize(name) }?.value }
         set {
-            if let newValue { set(name, newValue) } else { remove(name) }
+            switch newValue {
+            case .some(let value): set(name, value)
+            case .none: remove(name)
+            }
         }
     }
 

@@ -11,7 +11,7 @@ public struct QueryParameters: Sendable, Sequence, Equatable {
 
     static func parse(uri: String) -> (path: String, query: QueryParameters) {
         let pieces = uri.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)
-        let rawPath = pieces.first.map(String.init) ?? "/"
+        let rawPath = String(pieces[0])
         guard pieces.count == 2 else { return (rawPath, .init()) }
 
         var values: [String: [String]] = [:]
@@ -84,8 +84,8 @@ public struct Request: Sendable {
     public func decode<T: Decodable>(
         _ type: T.Type,
         decoder: JSONDecoder = .init()
-    ) throws -> T {
-        try body.decode(type, decoder: decoder)
+    ) async throws -> T {
+        try await body.decode(type, decoder: decoder)
     }
 
     public func cookie(_ name: String) -> String? {

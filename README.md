@@ -168,3 +168,16 @@ try await server.listen(ServerConfiguration(
 ```
 
 The default request-body limit is 10 MiB. Timeouts use cooperative Swift task cancellation.
+
+Pass PEM-encoded credentials to serve HTTP/1.1 over TLS. `cert` may contain a chain, leaf first. `listen` fails with `ServerError.invalidConfiguration` if the key or certificate cannot be loaded. Passphrase-protected keys and client certificates are not yet supported.
+
+```swift
+try await server.listen(ServerConfiguration(
+    hostname: "0.0.0.0",
+    port: 8443,
+    tls: .init(
+        key: privateKeyPEM,
+        cert: certificateChainPEM
+    )
+))
+```

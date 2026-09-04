@@ -2,6 +2,7 @@ import Foundation
 import NIOCore
 import NIOHTTP1
 import NIOPosix
+import NIOSSL
 import Synchronization
 
 public enum ServerError: Error, Sendable, Equatable, CustomStringConvertible {
@@ -185,6 +186,7 @@ public final class YoHTTPServer: Sendable {
     public func listen(_ configuration: ServerConfiguration) async throws {
         try Self.validate(configuration)
         guard registeredHandler.withLock({ $0 != nil }) else { throw ServerError.noHandler }
+        let sslContext = try configuration.tls.map(Self.makeSSLContext)
         let claimed = state.withLock { state -> Bool in
             guard state.channel == nil, !state.isBinding else { return false }
             state.isBinding = true
@@ -194,7 +196,7 @@ public final class YoHTTPServer: Sendable {
         guard claimed else { throw ServerError.alreadyListening }
 
         do {
-            let serverChannel = try await makeServerChannel(configuration: configuration)
+            let serverChannel = try await makeServerChannel(configuration: configuration, sslContext: sslContext)
             if let afterBinding { await afterBinding() }
             let shouldStop = state.withLock { state in
                 state.channel = serverChannel.channel
@@ -232,7 +234,8 @@ public final class YoHTTPServer: Sendable {
     }
 
     private func makeServerChannel(
-        configuration: ServerConfiguration
+        configuration: ServerConfiguration,
+        sslContext: NIOSSLContext?
     ) async throws -> NIOAsyncChannel<HTTPConnection, Never> {
         try await ServerBootstrap(group: eventLoopGroup)
             .serverChannelOption(ChannelOptions.backlog, value: Int32(configuration.backlog))
@@ -247,6 +250,9 @@ public final class YoHTTPServer: Sendable {
                 serverBackPressureStrategy: nil
             ) { channel in
                 channel.eventLoop.makeCompletedFuture {
+                    if let sslContext {
+                        try channel.pipeline.syncOperations.addHandler(NIOSSLServerHandler(context: sslContext))
+                    }
                     try channel.pipeline.syncOperations.configureHTTPServerPipeline()
                     try channel.pipeline.syncOperations.addHandler(SendableResponseEncoder())
                     let asyncChannel = try NIOAsyncChannel<HTTPServerRequestPart, SendableResponsePart>(
@@ -465,6 +471,44 @@ public final class YoHTTPServer: Sendable {
         }
         guard configuration.maxRequestBodySize >= 0 else {
             throw ServerError.invalidConfiguration("maxRequestBodySize must not be negative")
+        }
+        if let tls = configuration.tls {
+            guard !tls.key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw ServerError.invalidConfiguration("TLS private key must not be empty")
+            }
+            guard !tls.cert.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw ServerError.invalidConfiguration("TLS certificate chain must not be empty")
+            }
+        }
+    }
+
+    private static func makeSSLContext(_ tls: TLS) throws -> NIOSSLContext {
+        let certificates: [NIOSSLCertificate]
+        do {
+            certificates = try NIOSSLCertificate.fromPEMBytes(Array(tls.cert.utf8))
+        } catch {
+            throw ServerError.invalidConfiguration("TLS certificate chain is not valid PEM")
+        }
+        guard !certificates.isEmpty else {
+            throw ServerError.invalidConfiguration("TLS certificate chain is not valid PEM")
+        }
+
+        let privateKey: NIOSSLPrivateKey
+        do {
+            privateKey = try NIOSSLPrivateKey(bytes: Array(tls.key.utf8), format: .pem)
+        } catch {
+            throw ServerError.invalidConfiguration("TLS private key is not valid PEM")
+        }
+
+        do {
+            var tlsConfiguration = TLSConfiguration.makeServerConfiguration(
+                certificateChain: certificates.map { .certificate($0) },
+                privateKey: .privateKey(privateKey)
+            )
+            tlsConfiguration.applicationProtocols = ["http/1.1"]
+            return try NIOSSLContext(configuration: tlsConfiguration)
+        } catch {
+            throw ServerError.invalidConfiguration("TLS credentials could not be loaded")
         }
     }
 

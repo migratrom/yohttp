@@ -34,6 +34,9 @@ struct ServerLifecycleTests {
             ServerConfiguration(port: 0, backlog: 0),
             ServerConfiguration(port: 0, backlog: -1),
             ServerConfiguration(port: 0, maxRequestBodySize: -1),
+            ServerConfiguration(port: 0, tls: TLS(key: "", cert: TLSFixtures.cert)),
+            ServerConfiguration(port: 0, tls: TLS(key: TLSFixtures.key, cert: "")),
+            ServerConfiguration(port: 0, tls: TLS(key: "   ", cert: TLSFixtures.cert)),
         ]
         for configuration in configurations {
             let server = YoHTTPServer()

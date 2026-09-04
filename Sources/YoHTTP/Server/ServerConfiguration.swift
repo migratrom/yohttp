@@ -1,3 +1,13 @@
+public struct TLS: Sendable, Equatable {
+    public var key: String
+    public var cert: String
+
+    public init(key: String, cert: String) {
+        self.key = key
+        self.cert = cert
+    }
+}
+
 public struct ServerConfiguration: Sendable {
     public var hostname: String
     public var port: Int
@@ -6,6 +16,7 @@ public struct ServerConfiguration: Sendable {
     public var maxRequestBodySize: Int
     public var requestTimeout: Duration?
     public var serverName: String?
+    public var tls: TLS?
 
     public init(
         hostname: String = "127.0.0.1",
@@ -14,7 +25,8 @@ public struct ServerConfiguration: Sendable {
         reuseAddress: Bool = true,
         maxRequestBodySize: Int = 10 * 1024 * 1024,
         requestTimeout: Duration? = nil,
-        serverName: String? = "yohttp"
+        serverName: String? = "yohttp",
+        tls: TLS? = nil
     ) {
         self.hostname = hostname
         self.port = port
@@ -23,5 +35,6 @@ public struct ServerConfiguration: Sendable {
         self.maxRequestBodySize = maxRequestBodySize
         self.requestTimeout = requestTimeout
         self.serverName = serverName
+        self.tls = tls
     }
 }

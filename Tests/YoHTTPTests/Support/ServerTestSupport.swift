@@ -1,4 +1,7 @@
 import Foundation
+import NIOCore
+import NIOPosix
+import NIOSSL
 import Testing
 @testable import YoHTTP
 
@@ -27,7 +30,7 @@ struct RawHTTPResponse: Sendable {
     }
 }
 
-func waitForAddress(of server: YoHTTPServer) async throws -> SocketAddress {
+func waitForAddress(of server: YoHTTPServer) async throws -> YoHTTP.SocketAddress {
     for _ in 0..<500 {
         if let address = server.localAddress { return address }
         try await Task.sleep(for: .milliseconds(5))
@@ -38,7 +41,7 @@ func waitForAddress(of server: YoHTTPServer) async throws -> SocketAddress {
 func withServer<T: Sendable>(
     configuration: ServerConfiguration = .init(hostname: "127.0.0.1", port: 0),
     handler: @escaping Handler,
-    operation: (YoHTTPServer, SocketAddress) async throws -> T
+    operation: (YoHTTPServer, YoHTTP.SocketAddress) async throws -> T
 ) async throws -> T {
     let server = YoHTTPServer()
     server.handler(handler)
@@ -145,6 +148,44 @@ func exchangeRawHTTP(
         }
         return response
     }.value
+}
+
+func exchangeRawHTTPS(port: Int, tls: TLS, request: String) async throws -> Data {
+    try await exchangeRawHTTPS(port: port, tls: tls, requestParts: [request])
+}
+
+func exchangeRawHTTPS(port: Int, tls: TLS, requestParts: [String]) async throws -> Data {
+    let certificates = try NIOSSLCertificate.fromPEMBytes(Array(tls.cert.utf8))
+    var clientTLS = TLSConfiguration.makeClientConfiguration()
+    clientTLS.trustRoots = .certificates(certificates)
+    let sslContext = try NIOSSLContext(configuration: clientTLS)
+
+    let clientChannel = try await ClientBootstrap(group: MultiThreadedEventLoopGroup.singleton)
+        .channelOption(ChannelOptions.connectTimeout, value: .seconds(3))
+        .connect(host: "127.0.0.1", port: port) { channel in
+            channel.eventLoop.makeCompletedFuture {
+                try channel.pipeline.syncOperations.addHandler(
+                    try NIOSSLClientHandler(context: sslContext, serverHostname: "localhost")
+                )
+                return try NIOAsyncChannel<ByteBuffer, ByteBuffer>(wrappingChannelSynchronously: channel)
+            }
+        }
+
+    return try await clientChannel.executeThenClose { inbound, outbound in
+        for part in requestParts {
+            var buffer = ByteBuffer()
+            buffer.writeString(part)
+            try await outbound.write(buffer)
+        }
+        var response = Data()
+        for try await chunk in inbound {
+            var chunk = chunk
+            if let bytes = chunk.readBytes(length: chunk.readableBytes) {
+                response.append(contentsOf: bytes)
+            }
+        }
+        return response
+    }
 }
 
 func openAndCloseRawConnection(port: Int) async throws {

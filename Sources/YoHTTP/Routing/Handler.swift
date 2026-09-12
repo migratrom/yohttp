@@ -1,34 +1,37 @@
-public typealias Handler = @Sendable (Request) async throws -> Response
-public typealias Middleware = @Sendable (Request, Next) async throws -> Response
+import NIOCore
+import NIOHTTP1
+
+public typealias Handler = @Sendable (consuming Request, borrowing Response) throws -> Void
+public typealias Middleware = @Sendable (consuming Request, borrowing Response, Next) throws -> Void
 
 public struct Next: Sendable {
-    private let handler: Handler
-    public init(_ handler: @escaping Handler) { self.handler = handler }
-    public func callAsFunction(_ request: Request) async throws -> Response {
-        try await handler(request)
-    }
+	private let handler: Handler
+	public init(_ handler: @escaping Handler) { self.handler = handler }
+	public func callAsFunction(
+		_ request: consuming Request, _ response: borrowing Response
+	) throws {
+		try handler(request, response)
+	}
 }
 
 public protocol HTTPError: Error, Sendable {
-    var status: Status { get }
-    var headers: Headers { get }
-    var body: Body { get }
+	var status: HTTPResponseStatus { get }
+	var headers: HTTPHeaders { get }
+	var body: ByteBuffer { get }
 }
 
 public struct Abort: HTTPError {
-    public let status: Status
-    public let headers: Headers
-    public let body: Body
+	public let status: HTTPResponseStatus
+	public let headers: HTTPHeaders
+	public let body: ByteBuffer
 
-    public init(_ status: Status, headers: Headers = .init(), body: String = "") {
-        self.status = status
-        self.headers = headers
-        self.body = Body(body)
-    }
-
-    public init(_ status: Status, headers: Headers = .init(), body: Body) {
-        self.status = status
-        self.headers = headers
-        self.body = body
-    }
+	public init(
+		_ status: HTTPResponseStatus,
+		headers: HTTPHeaders = .init(),
+		body: ByteBuffer = .init()
+	) {
+		self.status = status
+		self.headers = headers
+		self.body = body
+	}
 }

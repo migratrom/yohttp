@@ -1,116 +1,125 @@
 # yohttp
 
-`yohttp` is a small, concurrency-safe Swift HTTP/1.1 server library. It gives application code a Swift-native async API while SwiftNIO owns sockets, protocol parsing, pipelining, and backpressure.
+`yohttp` is a small, concurrency-safe HTTP/1.1 server library backed by
+SwiftNIO. It dispatches application callbacks directly on NIO event loops;
+handlers are synchronous and must offload expensive work themselves.
 
 ## Requirements
 
 - Swift 6.3 or newer
 - macOS 15 or newer, or a Swift 6.3-supported Linux distribution
 
-## Installation
-
-Add the package to `Package.swift`:
-
-```swift
-dependencies: [
-    .package(url: "https://github.com/your-org/yohttp.git", from: "1.0.0"),
-]
-```
-
-Then add the product to your target:
-
-```swift
-.target(
-    name: "App",
-    dependencies: [.product(name: "YoHTTP", package: "yohttp")]
-)
-```
-
 ## Quick start
 
 ```swift
 import YoHTTP
 
-let router = YoHTTPRouter()
-
-router.path("/users", handlers: .init(
-    GET: { request in
-        Response.text("users")
-    },
-    POST: { request in
-        Response(status: .created)
+@Route(.GET, "/health")
+struct Health {
+    func handle(_ request: consuming Request, _ response: borrowing Response) throws {
+        response.head.initialize(.init(version: request.head.version, status: .ok))
+        response.write(ByteBuffer(string: "ok"))
+        response.end()
     }
-))
+}
+
+let router = YoHTTPRouter()
+router.register(Health.self)
+router.registrationLocked()
 
 let server = YoHTTPServer()
 server.handler(router)
 try await server.listen("127.0.0.1", 9090)
 ```
 
-Run the included example with `swift run yohttp-example`, then open `http://127.0.0.1:9090/users`.
+## Request and response streams
 
-## Routing
+YoHTTP re-exports `NIOCore` and `NIOHTTP1`. Requests expose NIO's
+`HTTPRequestHead` directly through `request.head`; `Request` otherwise carries
+the streamed `Body`, peer `SocketAddress`, and router path parameters.
 
-Routes may be registered together or one method at a time:
-
-```swift
-router.GET("/users/:id") { request in
-    let id = try request.parameters.require("id")
-    return .text("user \(id)")
-}
-
-router.POST("/messages") { request in
-    struct Input: Decodable { let text: String }
-    let input = try request.decode(Input.self)
-    return try .json(["text": input.text], status: .created)
-}
-
-router.GET("/assets/*path") { request in
-    .text(try request.parameters.require("path"))
-}
-```
-
-Literal segments win over `:parameters`, and parameters win over a final `*wildcard`. `HEAD` falls back to `GET`; `OPTIONS` is synthesized when it has no explicit handler; and known paths return `405 Method Not Allowed` with an `Allow` header.
-
-Groups compose prefixes and scope middleware:
+Handlers receive a request and a one-shot response writer:
 
 ```swift
-router.group("/api") { api in
-    api.middleware { request, next in
-        guard request.header("Authorization") != nil else {
-            throw Abort(.unauthorized)
+server.handler { request, response in
+    let writer = response.writer()
+    var byteCount = 0
+    writer.head.initialize(.init(version: request.head.version, status: .ok))
+    request.body.stream()
+        .onChunk { byteCount += $0.readableBytes }
+        .onEnd {
+            writer.write(ByteBuffer(string: "received \(byteCount) bytes"))
+            writer.end()
         }
-        return try await next(request)
-    }
-
-    api.GET("/health") { _ in .text("ok") }
+        .onError { _ in
+            writer.write(ByteBuffer(string: "invalid upload"))
+            writer.end()
+        }
 }
 ```
 
-Middleware registered on the root router applies globally. Middleware runs in registration order on the way in and reverse order on the way out. Resolved path parameters are visible to applicable middleware.
+`onChunk`, `onEnd`, and `onError` run on the selected NIO event loop. Do not
+block them. To apply backpressure while application-owned work catches up, call
+`stream.pause()` and later `stream.resume()`. A body without a registered chunk
+callback is drained without application buffering.
 
-## Requests and responses
+`Request` and `Response` are move-only (`~Copyable`) capabilities. Handlers
+consume the request and borrow the response, so macro endpoints must spell their
+parameters as `consuming Request` and `borrowing Response`.
 
-`Request` exposes the method, original URI, path, case-insensitive headers, owned body, repeated query parameters, path parameters, cookies, and peer address. Bodies can be decoded with a custom `JSONDecoder`.
-
-`Response` has helpers for text, HTML, JSON, redirects, and cookies. Throw `Abort`—or any custom `HTTPError`—to produce a controlled response. Other errors become a generic `500 Internal Server Error` without leaking implementation details.
+`Response` is a thread-safe, one-shot writer. Initialize it with an NIO
+`HTTPResponseHead`, optionally mutate that head, then write `ByteBuffer` chunks
+and finish with optional NIO trailer headers. `write` and `end` commit an
+initialized head automatically; call `response.head.commit()` to flush headers
+before body bytes. To retain a writer in a stream callback or application-owned
+work on another executor, obtain its copyable `ResponseWriter` with
+`response.writer()`.
 
 ```swift
-var response = Response.text("signed in")
-response.cookie(Cookie(
-    name: "session",
-    value: token,
-    path: "/",
-    secure: true,
-    httpOnly: true,
-    sameSite: .lax
-))
-return response
+server.handler { request, response in
+    response.head.initialize(.init(version: request.head.version, status: .ok))
+    response.head.modify {
+        $0.headers.add(name: "X-Request-ID", value: UUID().uuidString)
+    }
+    response.write(ByteBuffer(string: "first chunk\n"))
+    response.write(ByteBuffer(string: "second chunk\n"))
+    response.end()
+}
 ```
+
+## Routing and middleware
+
+Route endpoints and middleware use the same synchronous writer contract:
+
+```swift
+router.middleware { request, response, next in
+    response.head.modify { $0.headers.add(name: "X-Service", value: "example") }
+    try next(request, response)
+}
+```
+
+`@Route` accepts one method or an array of methods. Literal segments outrank
+parameters, which outrank a final wildcard. `HEAD` falls back to `GET`,
+`OPTIONS` is synthesized when missing, and unsupported methods for known paths
+return `405` with `Allow`.
+
+Configure all routes and middleware before calling `router.registrationLocked()`.
+That makes the routing table immutable; adding routes or middleware afterwards is
+a programming error. Lock registration before obtaining the router handler or
+serving a request.
 
 ## Lifecycle and configuration
 
-`listen` binds and suspends while serving. Call `shutdown()` from another task to close the listener and active connections. Port `0` asks the operating system for a free port; inspect `server.localAddress` after the bind completes.
+Each server owns one NIO event loop by default. Increase the count only when
+your application has a demonstrated need:
+
+```swift
+let server = YoHTTPServer(runtimeConfiguration: .init(eventLoopCount: 4))
+```
+
+`listen` binds and suspends while serving. Call `shutdown()` from another task
+to close the listener and active connections. `ServerConfiguration` keeps its
+network settings and provides two optional deadlines:
 
 ```swift
 try await server.listen(ServerConfiguration(
@@ -118,20 +127,13 @@ try await server.listen(ServerConfiguration(
     port: 8080,
     maxRequestBodySize: 2 * 1024 * 1024,
     requestTimeout: .seconds(15),
+    responseTimeout: .seconds(30),
     serverName: "my-service"
 ))
 ```
 
-The default request-body limit is 10 MiB. Timeouts use cooperative Swift task cancellation. TLS termination, streaming bodies, WebSockets, and HTTP/2 are deliberately outside the 1.0 protocol surface; deploy behind a capable proxy when those are needed.
+`requestTimeout` covers receipt from request head through body end and returns
+`408`. `responseTimeout` starts after the body ends; an uncommitted response
+receives `504`, while an already-started response connection is closed.
 
-## Testing handlers
-
-The router does not require a listening socket:
-
-```swift
-let response = try await router.respond(to: Request(method: .GET, uri: "/users/42"))
-```
-
-Run all unit and live-socket integration tests with `swift test`.
-
-Architecture choices and their consequences are recorded in [ADRs](ADRs/).
+Pass PEM credentials with `TLS(key:cert:)` to serve HTTP/1.1 over TLS.

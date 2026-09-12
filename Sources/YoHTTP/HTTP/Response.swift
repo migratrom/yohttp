@@ -1,66 +1,61 @@
-import Foundation
+import NIOCore
+import NIOHTTP1
 
-public struct Response: Sendable, Equatable {
-    public var status: Status
-    public var headers: Headers
-    public var body: Body
+/// A staged HTTP response head.
+///
+/// Initialize and optionally modify the head before committing it. ``commit()``
+/// flushes the head immediately; ``Response/write(_:)`` and ``Response/end(_:)``
+/// commit it automatically when needed.
+public final class ResponseHead: Sendable {
+	private let submit: @Sendable (Response.Command) -> Void
 
-    public init(status: Status = .ok, headers: Headers = .init(), body: Body = .empty) {
-        self.status = status
-        self.headers = headers
-        self.body = body
-    }
+	fileprivate init(submit: @escaping @Sendable (Response.Command) -> Void) {
+		self.submit = submit
+	}
 
-    public init(status: Status = .ok, headers: Headers = .init(), body: String) {
-        self.init(status: status, headers: headers, body: Body(body))
-    }
+	public func initialize(_ head: HTTPResponseHead) { submit(.initialize(head)) }
+	public func modify(
+		_ transform: @escaping @Sendable (inout HTTPResponseHead) -> Void
+	) { submit(.modify(transform)) }
+	public func commit() { submit(.commit) }
+}
 
-    public static func text(
-        _ value: String,
-        status: Status = .ok,
-        headers: Headers = .init()
-    ) -> Response {
-        var headers = headers
-        headers["Content-Type"] = MediaType.text.rawValue
-        return Response(status: status, headers: headers, body: value)
-    }
+/// A copyable writer retained by an asynchronous callback.
+public final class ResponseWriter: Sendable {
+	private let submit: @Sendable (Response.Command) -> Void
+	public let head: ResponseHead
 
-    public static func html(
-        _ value: String,
-        status: Status = .ok,
-        headers: Headers = .init()
-    ) -> Response {
-        var headers = headers
-        headers["Content-Type"] = MediaType.html.rawValue
-        return Response(status: status, headers: headers, body: value)
-    }
+	fileprivate init(submit: @escaping @Sendable (Response.Command) -> Void) {
+		self.submit = submit
+		head = ResponseHead(submit: submit)
+	}
 
-    public static func json<T: Encodable>(
-        _ value: T,
-        status: Status = .ok,
-        headers: Headers = .init(),
-        encoder: JSONEncoder = .init()
-    ) throws -> Response {
-        var headers = headers
-        headers["Content-Type"] = MediaType.json.rawValue
-        return Response(status: status, headers: headers, body: Body(try encoder.encode(value)))
-    }
+	public func write(_ buffer: ByteBuffer) { submit(.write(buffer)) }
+	public func end(_ trailers: HTTPHeaders? = nil) { submit(.end(trailers)) }
+}
 
-    public static func redirect(
-        _ location: String,
-        status: Status = .found,
-        headers: Headers = .init()
-    ) -> Response {
-        var headers = headers
-        headers["Location"] = location
-        return Response(status: status, headers: headers)
-    }
+/// A move-only, event-driven HTTP response capability.
+///
+/// Use it synchronously while handling a request. To retain a writer for an
+/// asynchronous callback or application-owned executor, call ``writer()``.
+public struct Response: ~Copyable, Sendable {
+	enum Command: Sendable {
+		case initialize(HTTPResponseHead)
+		case modify(@Sendable (inout HTTPResponseHead) -> Void)
+		case commit
+		case write(ByteBuffer)
+		case end(HTTPHeaders?)
+	}
 
-    public mutating func cookie(_ cookie: Cookie) {
-        headers.add("Set-Cookie", cookie.serialized())
-    }
+	private let storage: ResponseWriter
 
-    public mutating func deleteCookie(_ name: String, path: String = "/") {
-        cookie(Cookie(name: name, value: "", path: path, expires: Date(timeIntervalSince1970: 0), maxAge: .zero))
-    }
+	init(submit: @escaping @Sendable (Command) -> Void) {
+		storage = ResponseWriter(submit: submit)
+	}
+
+	/// Returns a copyable writer suitable for retaining in asynchronous work.
+	public func writer() -> ResponseWriter { storage }
+	public var head: ResponseHead { storage.head }
+	public func write(_ buffer: ByteBuffer) { storage.write(buffer) }
+	public func end(_ trailers: HTTPHeaders? = nil) { storage.end(trailers) }
 }
